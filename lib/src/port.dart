@@ -22,14 +22,17 @@
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
+import 'dart:async';
 import 'dart:ffi' as ffi;
 import 'dart:io';
+import 'dart:isolate';
 import 'dart:typed_data';
 
 import 'package:ffi/ffi.dart' as ffi;
 import 'package:serial_port/src/bindings.dart';
 import 'package:serial_port/src/config.dart';
 import 'package:serial_port/src/dylib.dart';
+import 'package:serial_port/src/enums.dart';
 import 'package:serial_port/src/utf8.dart';
 import 'package:meta/meta.dart';
 
@@ -65,6 +68,7 @@ abstract class SerialPort {
   SerialPortConfig get config;
   void set config(SerialPortConfig config);
 
+  Stream<Uint8List> get onReceive;
   Future<Uint8List> read(int bytes, {int timeout = 0});
   Uint8List readSync(int bytes, {int timeout = 0});
 
@@ -136,8 +140,47 @@ class _SerialPortImpl implements SerialPort {
   @mustCallSuper
   void dispose() => dylib.sp_free_port(_port);
 
-  bool open(int mode) => dylib.sp_open(_port, mode) == sp_return.SP_OK;
-  bool close() => dylib.sp_close(_port) == sp_return.SP_OK;
+  Isolate _reader;
+  final _controller = StreamController<Uint8List>();
+  Stream<Uint8List> get onReceive => _controller.stream;
+
+  static void _sp_reader(Map args) {
+    final int address = args['address'];
+    final SendPort sendPort = args['sendPort'];
+    final ffi.Pointer<sp_port> port = ffi.Pointer<sp_port>.fromAddress(address);
+    final ffi.Pointer<ffi.Pointer<sp_event_set>> events = ffi.allocate();
+    dylib.sp_new_event_set(events);
+    dylib.sp_add_port_events(events.value, port, sp_event.SP_EVENT_RX_READY);
+    while (true) {
+      dylib.sp_wait(events.value, 500);
+      final bytes = dylib.sp_input_waiting(port);
+      if (bytes == sp_return.SP_ERR_ARG) {
+        break;
+      }
+      if (bytes > 0) {
+        final data = _read(bytes, (ffi.Pointer<ffi.Uint8> ptr) {
+          return dylib.sp_nonblocking_read(port, ptr.cast(), bytes);
+        });
+        sendPort.send(data);
+      }
+    }
+  }
+
+  bool open(int mode) {
+    if (mode == SerialPortMode.read || mode == SerialPortMode.readWrite) {
+      final receiver = ReceivePort();
+      receiver.listen((data) => _controller.add(data));
+      final args = {'address': _port.address, 'sendPort': receiver.sendPort};
+      Isolate.spawn(_sp_reader, args).then((reader) => _reader = reader);
+    }
+    return dylib.sp_open(_port, mode) == sp_return.SP_OK;
+  }
+
+  bool close() {
+    _reader?.kill();
+    _reader = null;
+    return dylib.sp_close(_port) == sp_return.SP_OK;
+  }
 
   String get name => Utf8.fromUtf8(dylib.sp_get_port_name(_port));
   String get description {
@@ -205,7 +248,7 @@ class _SerialPortImpl implements SerialPort {
     _sp_call(() => dylib.sp_set_config(_port, config.toNative()));
   }
 
-  Uint8List _read(int bytes, _SerialReader reader) {
+  static Uint8List _read(int bytes, _SerialReader reader) {
     final ptr = ffi.allocate<ffi.Uint8>(count: bytes);
     var len = 0;
     _sp_call(() => len = reader(ptr));
@@ -226,7 +269,7 @@ class _SerialPortImpl implements SerialPort {
     });
   }
 
-  int _write(Uint8List bytes, _SerialWriter writer) {
+  static int _write(Uint8List bytes, _SerialWriter writer) {
     final len = bytes.length;
     final ptr = ffi.allocate<ffi.Uint8>(count: len);
     ptr.asTypedList(len).setAll(0, bytes);
