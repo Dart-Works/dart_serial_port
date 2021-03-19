@@ -1,0 +1,84 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+jobs:
+  linux:
+    name: Linux
+    runs-on: ubuntu-18.04
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v2
+    - name: Install Dart
+      uses: dart-lang/setup-dart@v1
+    - name: Get Dependencies
+      run: dart pub get
+    - name: Install libserialport
+      run: |
+        git clone https://github.com/sigrokproject/libserialport.git
+        cd libserialport
+        ./autogen.sh
+        ./configure
+        make -j $(nproc)
+        sudo make install
+        sudo ldconfig
+        cd -
+    - name: Install tty0tty
+      run: |
+        git clone https://github.com/lcgamboa/tty0tty.git
+        sudo apt install -y linux-headers-`uname -r`
+        cd tty0tty/module
+        make -j $(nproc)
+        sudo make install
+        cd -
+    - name: Run tty0tty
+      run: tty0tty &
+    - name: Fixup Permissions
+      run: sudo chmod a+rw /dev/tnt*
+    - name: Run Tests
+      run: dart pub run test
+
+  macos:
+    name: macOS
+    runs-on: macos-latest
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v2
+    - name: Install Dart
+      uses: dart-lang/setup-dart@v1
+    - name: Install libserialport
+      run: brew install libserialport
+    - name: Get Dependencies
+      run: dart pub get
+    - name: Run Tests
+      run: dart pub run test/dylib_test.dart
+      env:
+        # file system relative paths not allowed in hardened programs
+        LIBSERIALPORT_PATH: /usr/local/Cellar/libserialport/0.1.1/lib/libserialport.dylib
+
+  windows:
+    name: Windows
+    runs-on: windows-latest
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v2
+    - name: Install Dart
+      uses: dart-lang/setup-dart@v1
+    - name: Setup MSVC
+      uses: ilammy/msvc-dev-cmd@v1
+    - name: Install libserialport
+      run: |
+        git clone https://github.com/jpnurmi/flutter_serial_port.git
+        cd flutter_serial_port\windows\libserialport
+        cmake -G "NMake Makefiles" .
+        nmake
+        cp serialport.dll ..\..\..
+        cd ..\..\..
+    - name: Get Dependencies
+      run: dart pub get
+    - name: Run Tests
+      run: dart pub run test/dylib_test.dart

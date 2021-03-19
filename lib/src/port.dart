@@ -30,6 +30,7 @@ import 'package:dart_serial_port/src/bindings.dart';
 import 'package:dart_serial_port/src/config.dart';
 import 'package:dart_serial_port/src/dylib.dart';
 import 'package:dart_serial_port/src/enums.dart';
+import 'package:dart_serial_port/src/error.dart';
 import 'package:dart_serial_port/src/util.dart';
 
 /// Serial port.
@@ -52,7 +53,7 @@ import 'package:dart_serial_port/src/util.dart';
 ///       port.write(...);
 ///     try {
 ///     } on SerialPortError catch (e) {
-///       print('${SerialPort.lastErrorMessage} (${SerialPort.lastErrorCode})');
+///       print(SerialPort.lastError);
 ///     }
 ///
 /// The error message is that provided by the OS, using the current language
@@ -89,7 +90,7 @@ abstract class SerialPort {
   ///
   /// See also:
   /// - [SerialPortMode]
-  bool open({int mode});
+  bool open({required int mode});
 
   /// Opens the serial port for reading only.
   bool openRead();
@@ -103,15 +104,18 @@ abstract class SerialPort {
   /// Closes the serial port.
   bool close();
 
+  /// Gets whether the serial port is open.
+  bool get isOpen;
+
   /// Gets the name of the port.
   ///
   /// The name returned is whatever is normally used to refer to a port on the
   /// current operating system; e.g. for Windows it will usually be a "COMn"
   /// device name, and for Unix it will be a device path beginning with "/dev/".
-  String get name;
+  String? get name;
 
   /// Gets the description of the port, for presenting to end users.
-  String get description;
+  String? get description;
 
   /// Gets the transport type used by the port.
   ///
@@ -120,28 +124,28 @@ abstract class SerialPort {
   int get transport;
 
   /// Gets the USB bus number of a USB serial adapter port.
-  int get busNumber;
+  int? get busNumber;
 
   /// Gets the USB device number of a USB serial adapter port.
-  int get deviceNumber;
+  int? get deviceNumber;
 
   /// Gets the USB vendor ID of a USB serial adapter port.
-  int get vendorId;
+  int? get vendorId;
 
   /// Gets the USB Product ID of a USB serial adapter port.
-  int get productId;
+  int? get productId;
 
   /// Get the USB manufacturer of a USB serial adapter port.
-  String get manufacturer;
+  String? get manufacturer;
 
   /// Gets the USB product name of a USB serial adapter port.
-  String get productName;
+  String? get productName;
 
   /// Gets the USB serial number of a USB serial adapter port.
-  String get serialNumber;
+  String? get serialNumber;
 
   /// Gets the MAC address of a Bluetooth serial adapter port.
-  String get macAddress;
+  String? get macAddress;
 
   /// Gets the current configuration of the serial port.
   SerialPortConfig get config;
@@ -196,16 +200,13 @@ abstract class SerialPort {
   /// Takes the port transmit line out of the break state.
   bool endBreak();
 
-  /// Gets the error code for a failed operation.
-  static int get lastErrorCode => _SerialPortImpl.lastErrorCode;
-
-  /// Gets the error message for a failed operation.
-  static String get lastErrorMessage => _SerialPortImpl.lastErrorMessage;
+  /// Gets the error for a failed operation.
+  static SerialPortError? get lastError => _SerialPortImpl.lastError;
 }
 
 class _SerialPortImpl implements SerialPort {
   final ffi.Pointer<sp_port> _port;
-  SerialPortConfig _config;
+  SerialPortConfig? _config;
 
   _SerialPortImpl(String name) : _port = _init(name);
   _SerialPortImpl.fromAddress(int address)
@@ -215,23 +216,28 @@ class _SerialPortImpl implements SerialPort {
   int get address => _port.address;
 
   static ffi.Pointer<sp_port> _init(String name) {
-    final out = ffi.allocate<ffi.Pointer<sp_port>>();
+    final out = ffi.calloc<ffi.Pointer<sp_port>>();
     final cstr = Util.toUtf8(name);
     Util.call(() => dylib.sp_get_port_by_name(cstr, out));
     final port = out[0];
-    ffi.free(out);
-    ffi.free(cstr);
+    ffi.calloc.free(out);
+    ffi.calloc.free(cstr);
     return port;
   }
 
   static List<String> get availablePorts {
-    final out = ffi.allocate<ffi.Pointer<ffi.Pointer<sp_port>>>();
-    Util.call(() => dylib.sp_list_ports(out));
+    final out = ffi.calloc<ffi.Pointer<ffi.Pointer<sp_port>>>();
+    final rv = Util.call(() => dylib.sp_list_ports(out));
+    if (rv != sp_return.SP_OK) {
+      ffi.calloc.free(out);
+      return <String>[];
+    }
     var i = -1;
-    var ports = <String>[];
+    final ports = <String>[];
     final array = out.value;
-    while (array[++i].address != 0x0) {
-      ports.add(Util.fromUtf8(dylib.sp_get_port_name(array[i])));
+    while (array[++i] != ffi.nullptr) {
+      final port = Util.fromUtf8(dylib.sp_get_port_name(array[i]));
+      if (port != null) ports.add(port);
     }
     dylib.sp_free_port_list(array);
     return ports;
@@ -244,7 +250,8 @@ class _SerialPortImpl implements SerialPort {
   }
 
   @override
-  bool open({int mode}) => dylib.sp_open(_port, mode) == sp_return.SP_OK;
+  bool open({required int mode}) =>
+      dylib.sp_open(_port, mode) == sp_return.SP_OK;
   @override
   bool openRead() => open(mode: SerialPortMode.read);
   @override
@@ -255,9 +262,17 @@ class _SerialPortImpl implements SerialPort {
   bool close() => dylib.sp_close(_port) == sp_return.SP_OK;
 
   @override
-  String get name => Util.fromUtf8(dylib.sp_get_port_name(_port));
+  bool get isOpen {
+    final handle = Util.toInt((ptr) {
+      return dylib.sp_get_port_handle(_port, ptr.cast());
+    })!;
+    return handle > 0;
+  }
+
   @override
-  String get description {
+  String? get name => Util.fromUtf8(dylib.sp_get_port_name(_port));
+  @override
+  String? get description {
     return Util.fromUtf8(dylib.sp_get_port_description(_port));
   }
 
@@ -265,50 +280,50 @@ class _SerialPortImpl implements SerialPort {
   int get transport => dylib.sp_get_port_transport(_port);
 
   @override
-  int get busNumber {
+  int? get busNumber {
     return Util.toInt((ptr) {
       return dylib.sp_get_port_usb_bus_address(_port, ptr, ffi.nullptr);
     });
   }
 
   @override
-  int get deviceNumber {
+  int? get deviceNumber {
     return Util.toInt((ptr) {
       return dylib.sp_get_port_usb_bus_address(_port, ffi.nullptr, ptr);
     });
   }
 
   @override
-  int get vendorId {
+  int? get vendorId {
     return Util.toInt((ptr) {
       return dylib.sp_get_port_usb_vid_pid(_port, ptr, ffi.nullptr);
     });
   }
 
   @override
-  int get productId {
+  int? get productId {
     return Util.toInt((ptr) {
       return dylib.sp_get_port_usb_vid_pid(_port, ffi.nullptr, ptr);
     });
   }
 
   @override
-  String get manufacturer {
+  String? get manufacturer {
     return Util.fromUtf8(dylib.sp_get_port_usb_manufacturer(_port));
   }
 
   @override
-  String get productName {
+  String? get productName {
     return Util.fromUtf8(dylib.sp_get_port_usb_product(_port));
   }
 
   @override
-  String get serialNumber {
+  String? get serialNumber {
     return Util.fromUtf8(dylib.sp_get_port_usb_serial(_port));
   }
 
   @override
-  String get macAddress {
+  String? get macAddress {
     return Util.fromUtf8(dylib.sp_get_port_bluetooth_address(_port));
   }
 
@@ -316,10 +331,10 @@ class _SerialPortImpl implements SerialPort {
   SerialPortConfig get config {
     if (_config == null) {
       _config = SerialPortConfig();
-      final ptr = ffi.Pointer<sp_port_config>.fromAddress(_config.address);
+      final ptr = ffi.Pointer<sp_port_config>.fromAddress(_config!.address);
       Util.call(() => dylib.sp_get_config(_port, ptr));
     }
-    return _config;
+    return _config!;
   }
 
   @override
@@ -365,10 +380,10 @@ class _SerialPortImpl implements SerialPort {
 
   @override
   int get signals {
-    final ptr = ffi.allocate<ffi.Int32>();
+    final ptr = ffi.calloc<ffi.Int32>();
     Util.call(() => dylib.sp_get_signals(_port, ptr));
     final value = ptr.value;
-    ffi.free(ptr);
+    ffi.calloc.free(ptr);
     return value;
   }
 
@@ -377,25 +392,23 @@ class _SerialPortImpl implements SerialPort {
   @override
   bool endBreak() => dylib.sp_end_break(_port) == sp_return.SP_OK;
 
-  static int get lastErrorCode => dylib.sp_last_error_code();
-
-  static String get lastErrorMessage {
+  static SerialPortError? get lastError {
     final ptr = dylib.sp_last_error_message();
     final str = Util.fromUtf8(ptr);
+    if (str == null) return null;
     dylib.sp_free_error_message(ptr);
-    return str;
+    return SerialPortError(str, dylib.sp_last_error_code());
   }
 
   @override
   bool operator ==(Object other) {
-    if (other.runtimeType != runtimeType) return false;
-    _SerialPortImpl port = other;
-    return _port == port._port;
+    if (identical(this, other)) return true;
+    return other is _SerialPortImpl && _port == other._port;
   }
 
   @override
   int get hashCode => _port.hashCode;
 
   @override
-  String toString() => '$runtimeType($_port)';
+  String toString() => 'SerialPort($_port)';
 }

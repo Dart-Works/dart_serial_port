@@ -30,6 +30,7 @@ import 'dart:typed_data';
 import 'package:ffi/ffi.dart' as ffi;
 import 'package:dart_serial_port/src/bindings.dart';
 import 'package:dart_serial_port/src/dylib.dart';
+import 'package:dart_serial_port/src/error.dart';
 import 'package:dart_serial_port/src/port.dart';
 import 'package:dart_serial_port/src/util.dart';
 
@@ -43,8 +44,11 @@ const int _kReadEvents = sp_event.SP_EVENT_RX_READY | sp_event.SP_EVENT_ERROR;
 /// **Note:** The reader must be closed using [close()] when done with reading.
 abstract class SerialPortReader {
   /// Creates a reader for the port.
-  factory SerialPortReader(SerialPort port, {int timeout}) =>
+  factory SerialPortReader(SerialPort port, {int? timeout}) =>
       _SerialPortReaderImpl(port, timeout: timeout);
+
+  /// Gets the port the reader operates on.
+  SerialPort get port;
 
   /// Gets a stream of data.
   Stream<Uint8List> get stream;
@@ -57,42 +61,58 @@ class _SerialPortReaderArgs {
   final int address;
   final int timeout;
   final SendPort sendPort;
-  _SerialPortReaderArgs({this.address, this.timeout, this.sendPort});
+  _SerialPortReaderArgs({
+    required this.address,
+    required this.timeout,
+    required this.sendPort,
+  });
 }
 
 class _SerialPortReaderImpl implements SerialPortReader {
   final SerialPort _port;
   final int _timeout;
-  Isolate _isolate;
-  ReceivePort _receiver;
-  StreamController<Uint8List> _controller;
+  Isolate? _isolate;
+  ReceivePort? _receiver;
+  StreamController<Uint8List>? __controller;
 
-  _SerialPortReaderImpl(SerialPort port, {int timeout})
+  _SerialPortReaderImpl(SerialPort port, {int? timeout})
       : _port = port,
         _timeout = timeout ?? 500;
 
   @override
-  Stream<Uint8List> get stream {
-    _controller ??= StreamController<Uint8List>(
-      onListen: _startRead,
-      onCancel: _cancelRead,
-    );
-    return _controller.stream;
-  }
+  SerialPort get port => _port;
+
+  @override
+  Stream<Uint8List> get stream => _controller.stream;
 
   @override
   void close() {
-    _controller?.close();
-    _controller = null;
+    __controller?.close();
+    __controller = null;
+  }
+
+  StreamController<Uint8List> get _controller {
+    return __controller ??= StreamController<Uint8List>(
+      onListen: _startRead,
+      onCancel: _cancelRead,
+      onPause: _cancelRead,
+      onResume: _startRead,
+    );
   }
 
   void _startRead() {
     _receiver = ReceivePort();
-    _receiver.listen((data) => _controller.add(data));
+    _receiver!.listen((data) {
+      if (data is SerialPortError) {
+        _controller.addError(data);
+      } else if (data is Uint8List) {
+        _controller.add(data);
+      }
+    });
     final args = _SerialPortReaderArgs(
       address: _port.address,
       timeout: _timeout,
-      sendPort: _receiver.sendPort,
+      sendPort: _receiver!.sendPort,
     );
     Isolate.spawn(
       _waitRead,
@@ -119,6 +139,8 @@ class _SerialPortReaderImpl implements SerialPortReader {
           return dylib.sp_nonblocking_read(port, ptr.cast(), bytes);
         });
         args.sendPort.send(data);
+      } else if (bytes < 0) {
+        args.sendPort.send(SerialPort.lastError);
       }
     }
     _releaseEvents(events);
@@ -128,7 +150,7 @@ class _SerialPortReaderImpl implements SerialPortReader {
     ffi.Pointer<sp_port> port,
     int mask,
   ) {
-    final events = ffi.allocate<ffi.Pointer<sp_event_set>>();
+    final events = ffi.calloc<ffi.Pointer<sp_event_set>>();
     dylib.sp_new_event_set(events);
     dylib.sp_add_port_events(events.value, port, mask);
     return events;
